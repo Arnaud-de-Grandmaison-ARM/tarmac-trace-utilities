@@ -67,7 +67,7 @@ static bool contains_only(const std::string &str, const char *permitted_chars)
 struct Token {
     static constexpr const char *decimal_digits = "0123456789";
     static constexpr const char *hex_digits = "0123456789ABCDEFabcdef";
-    static constexpr const char *hex_digits_us = "0123456789ABCDEFabcdef_";
+    static constexpr const char *regvalue_chars = "0123456789ABCDEFabcdef_-";
 
     size_t startpos, endpos;
     char c;   // '\0' if this is a word/EOL, otherwise a single punct character
@@ -97,7 +97,7 @@ struct Token {
         return stoull(s, NULL, 10);
     }
     inline bool ishex() const { return isword(hex_digits); }
-    inline bool ishex_us() const { return isword(hex_digits_us); }
+    inline bool isregvalue() const { return isword(regvalue_chars); }
     inline bool ishexwithoptionalnamespace() const
     {
         // Match a hex value, optionally followed by a namespace specifier,
@@ -256,6 +256,10 @@ struct TarmacLineParserImpl {
 
     void parse(const string &line_)
     {
+        // Constants used in 'byte' arrays for register and memory updates, to
+        // represent special values that aren't ordinary bytes.
+        constexpr uint16_t UNUSED = 0x100, UNKNOWN = 0x101;
+
         // Set up the lexer.
         line = line_;
         pos = 0;
@@ -313,7 +317,7 @@ struct TarmacLineParserImpl {
             bool is_ES = (tok == "ES");
 
             tok = lex();
-            if (tok == "EXC") {
+            if (tok == "EXC" || tok == "Reset") {
                 // Sometimes used to report an exception event relating to the
                 // instruction, e.g. because it was illegal. We abandon parsing
                 // this as an instruction event, and decide it's text-only.
@@ -519,26 +523,81 @@ struct TarmacLineParserImpl {
                 tok = lex();
             }
 
-            if (!tok.ishex_us())
-                parse_error(tok, "expected register contents");
-            Token contentstok;
-            copy_if(begin(tok.s), end(tok.s), back_inserter(contentstok.s),
-                    [](char c) { return c != '_'; });
-            tok = lex();
+            string contents;
+            auto consume_register_contents = [&contents](Token &tok) {
+                copy_if(begin(tok.s), end(tok.s), back_inserter(contents),
+                        [](char c) { return c != '_'; });
+            };
 
-            if (tok == ':') {
-                // Fast Models will sometimes break up a 64-bit
-                // register value with a colon. (Not consistently,
-                // though; updates to A64 core regs are just 16
-                // unseparated hex digits, but updates to FPCR get a
-                // colon. *shrug*)
+            // In most cases, lookup_reg_name will tell us how wide we
+            // expect the register to be. However, there are a couple
+            // of special cases.
+            //
+            // Register updates for 'sp' can mean either the AArch32
+            // or AArch64 stack pointer, which have different ids in
+            // the registers.hh system. So we defer figuring out which
+            // register we're looking at until we see whether we've
+            // been given 32 or 64 bits of data.
+            //
+            // And 'fpcr' is sometimes seen in traces with 64 bits of
+            // data, even though it's 32-bit; so in that case we have
+            // to read all 64, and keep the least-significant part.
+            RegisterId reg;
+            bool got_reg_id = lookup_reg_name(reg, regname);
+            bool is_fpcr = (got_reg_id && reg.prefix == RegPrefix::fpcr);
+            bool is_sp = (!strcasecmp(regname.c_str(), "sp") ||
+                          !strncasecmp(regname.c_str(), "sp_", 3));
+            bool special = is_fpcr || is_sp;
+
+            if (got_reg_id && !special) {
+                // Consume tokens of register contents until we've
+                // seen as much data as we expect. We tolerate the
+                // contents being separated into multiple tokens by
+                // spaces or colons, or having underscores in them
+                // (which our lexer will include in a single token).
+                size_t hex_digits_expected = 2 * reg_size(reg);
+                while (contents.size() < hex_digits_expected) {
+                    if (!tok.isregvalue())
+                        parse_error(tok, "expected register contents");
+                    consume_register_contents(tok);
+                    tok = lex();
+
+                    if (tok == ':')
+                        tok = lex();
+                }
+            } else if (special) {
+                // Special cases described above (SP and FPCR), where we have
+                // to wait to see how much data we can get out of the input
+                // line.
+                //
+                // In all cases of this so far encountered, it's enough to read
+                // a single contiguous token of register contents, plus a
+                // second one if a ':' follows it.
+                if (!tok.isregvalue())
+                    parse_error(tok, "expected register contents");
+                consume_register_contents(tok);
                 tok = lex();
-                if (!tok.ishex())
-                    parse_error(tok, "expected additional register "
-                                     "contents after ':'");
-                contentstok.s += tok.s;
-                contentstok.endpos = tok.endpos;
-                tok = lex();
+
+                if (tok == ':') {
+                    tok = lex();
+                    if (!tok.isregvalue())
+                        parse_error(tok, "expected additional register "
+                                    "contents after ':'");
+                    consume_register_contents(tok);
+                }
+
+                if (is_sp) {
+                    // If the special register was SP, use the size of the data
+                    // we've just collected to disambiguate between r13 and
+                    // xsp.
+                    if (contents.size() == 8) {
+                        reg = { RegPrefix::r, 13 };
+                        got_reg_id = true;
+                    } else if (contents.size() == 16) {
+                        reg = { RegPrefix::xsp, 0 };
+                        got_reg_id = true;
+                    }
+                }
             }
 
             // Fast Models puts nothing further on a register line. Other
@@ -546,17 +605,24 @@ struct TarmacLineParserImpl {
             // interpreting the hex CPSR value to show the individual NZCV
             // flags.
 
-            unsigned bits = contentstok.length() * 4;
+            unsigned bits = contents.size() * 4;
 
-            vector<uint8_t> bytes;
+            vector<uint16_t> bytes;
             if (bits % 8 != 0)
                 parse_error(tok, "expected register contents to be an integer"
                                  " number of bytes");
-            for (unsigned pos = 0; pos < bits / 4; pos += 2)
-                bytes.push_back(stoul(contentstok.s.substr(pos, 2), NULL, 16));
+            for (unsigned pos = 0; pos < bits / 4; pos += 2) {
+                string hex = contents.substr(pos, 2);
+                if (hex == "--") {
+                    // Special value indicating an unknown byte, in flavours of
+                    // Tarmac that include partial register updates.
+                    bytes.push_back(UNKNOWN);
+                } else {
+                    bytes.push_back(stoul(hex, NULL, 16));
+                }
+            }
 
-            RegisterId reg;
-            if (!lookup_reg_name(reg, regname, bits)) {
+            if (!got_reg_id) {
                 if (!unrecognised_registers_already_reported.count(regname)) {
                     unrecognised_registers_already_reported.insert(regname);
 #if 0
@@ -581,10 +647,32 @@ struct TarmacLineParserImpl {
                 return;
             }
 
-            RegisterEvent ev(time, reg, bytes);
-            if (bits <= 64)
-                ev.set_value(contentstok.hexvalue());
-            receiver->got_event(ev);
+            // Reverse the order of 'bytes'. Our internal
+            // representation of registers is little-endian, but the
+            // trace file will have specified the register value in
+            // normal human reading order, i.e. big-endian.
+            std::reverse(bytes.begin(), bytes.end());
+
+            // Truncate 'bytes' to 32 bits in the case of a 64-bit FPCR update.
+            // (We do this after the reversal, so that we keep the LSW of the
+            // 64-bit value, not the MSW.)
+            if (is_fpcr)
+                bytes.resize(reg_size(reg));
+
+            // Now go through 'bytes' and find maximal contiguous subsequences
+            // of non-UNKNOWN values, and emit each one as a RegisterEvent.
+            for (size_t offset = 0; offset < bytes.size() ;) {
+                if (bytes[offset] == UNKNOWN) {
+                    offset++;
+                } else {
+                    size_t start = offset;
+                    vector<uint8_t> realbytes;
+                    while (offset < bytes.size() && bytes[offset] != UNKNOWN)
+                        realbytes.push_back(bytes[offset++]);
+                    RegisterEvent ev(time, reg, start, realbytes);
+                    receiver->got_event(ev);
+                }
+            }
         } else if (tok == "MR1" || tok == "MR2" || tok == "MR4" ||
                    tok == "MR8" || tok == "MW1" || tok == "MW2" ||
                    tok == "MW4" || tok == "MW8" || tok == "MR1X" ||
@@ -684,7 +772,6 @@ struct TarmacLineParserImpl {
             // memory starting at the given base address. These words
             // may contain hex digits, dots and sometimes '#' to
             // indicate an actually unknown value.
-            constexpr uint16_t UNUSED = 0x100, UNKNOWN = 0x101;
             uint16_t bytes[16];
             int bytepos = 0;
 
@@ -787,7 +874,8 @@ struct TarmacLineParserImpl {
             string type(tok.s);
             if (type == "CADI" || type == "E" || type == "P" ||
                 type == "CACHE" || type == "TTW" || type == "BR" ||
-                type == "INFO_EXCEPTION_REASON" || type == "SIGNAL") {
+                type == "INFO_EXCEPTION_REASON" || type == "SIGNAL" ||
+                type == "EXC") {
                 // no warning
             } else {
                 if (!unrecognised_tarmac_events_reported.count(type)) {

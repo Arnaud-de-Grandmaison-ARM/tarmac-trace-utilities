@@ -280,26 +280,20 @@ void Index::got_event(RegisterEvent &ev)
          */
         reg.prefix = RegPrefix::d;
     }
-    auto offset = reg_offset(reg, curr_iflags);
-    auto size = reg_size(reg);
-    if (ev.got_value) {
-        update_memtree('r', offset, size, ev.value);
-        if (reg_update_overwrites_reg(offset, size, REG_sp(), curr_iflags))
-            update_sp(ev.value);
-        if (reg_update_overwrites_reg(offset, size, REG_lr(), curr_iflags))
-            insns_since_lr_update = 0;
-    } else {
-        // For registers bigger than 64 bits, we must update the
-        // memtree using the byte-array representation ev.bytes.
-        unsigned char *p = make_memtree_update('r', offset, size);
+    auto offset = reg_offset(reg, curr_iflags) + ev.offset;
+    auto size = ev.bytes.size();
+    unsigned char *p = make_memtree_update('r', offset, size);
+    memcpy(p, ev.bytes.data(), size);
 
-        // The 'r' address space is always little-endian, but ev.bytes
-        // has come directly from parsing the Tarmac file which gave
-        // the hex digits of the register value in normal human-
-        // readable base notation, i.e. big-endian.
-        for (unsigned i = 0; i < size; i++)
-            p[size - 1 - i] = ev.bytes[i];
+    if (reg_update_overwrites_reg(offset, size, REG_sp(), curr_iflags)) {
+        unsigned long long new_sp_value;
+        if (read_memtree_value('r', reg_offset(REG_sp(), curr_iflags),
+                               reg_size(REG_sp()), &new_sp_value))
+            update_sp(new_sp_value);
     }
+
+    if (reg_update_overwrites_reg(offset, size, REG_lr(), curr_iflags))
+        insns_since_lr_update = 0;
 }
 
 void Index::got_event(MemoryEvent &ev)

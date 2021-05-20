@@ -1329,9 +1329,18 @@ The fields are as follows:
   logical order, representing the raw contents of the register (even
   if it's a floating-point register).
 
-  In some cases, for some registers, the value has a ``:`` separator
-  in the middle. This is purely a visual separator and has no semantic
+  In some cases, for some registers, the value is broken up into
+  multiple sequences of hex numbers by ``:`` separators or spaces.
+  These are purely visual separators and have no semantic
   significance.
+
+  Sometimes a register update only specifies part of the new contents
+  of the register. This is indicated by specifying some bytes as
+  ``--`` instead of a pair of hex digits. The semantics are that those
+  bytes of the register are unaffected by the update. For example,
+  some RTL simulators will log an update to a floating-point register
+  such as ``d0`` or ``d1`` by representing it as a partial update of
+  the overlapping vector register such as ``q0``.
 
 *interpretation*
   Some variants of Tarmac follow the raw register value with a more
